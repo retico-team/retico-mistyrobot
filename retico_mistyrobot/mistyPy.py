@@ -1,9 +1,9 @@
 import requests
 import json
+import uuid
 import threading
 import time
 import websocket
-import numpy as np 
 import random
 try:
     import thread
@@ -62,12 +62,16 @@ class MistyRandomMoves:
         self.arm = 80
 
 
-
-
 class Robot:
 
     def __init__(self,ip):
         self.ip = ip
+        self._is_speaking = False
+        self._current_utt = None
+        self._clear_timer = None
+
+        # Initialize TTS WebSocket listener
+        self._tts_client = MistyTTSClient(ip, self._on_tts_complete)
 
         self.images_saved = []
         self.audio_saved  = []
@@ -83,6 +87,7 @@ class Robot:
         #self.populateImages()
         #self.populateAudio()
         #self.populateLearnedFaces()
+
 
     def start_small_random_movements(self):
 
@@ -124,8 +129,43 @@ class Robot:
         requests.post('http://'+self.ip+'/api/audio/volume',json={"Volume": vol}) 
 
     def say(self, text):
+        """
+        Send a TTS request and mark the robot as speaking until completion.
+        """
+        utt_id = uuid.uuid4().hex
+        payload = {
+            "Text": f"<speak>{text}</speak>",
+            "UtteranceId": utt_id
+        }
+        # POST to Misty TTS endpoint
         print("SAYING ", text)
-        requests.post('http://'+self.ip+'/api/tts/speak',json={"Text": '<speak>{}</speak>'.format(text)})       
+        requests.post(f"http://{self.ip}/api/tts/speak", json=payload)
+
+        # Track speaking state
+        self._is_speaking = True
+        self._current_utt = utt_id
+
+    def _on_tts_complete(self, utt_id):
+        """
+        Callback from MistyTTSClient when TTSComplete event received.
+        """
+        if utt_id == self._current_utt:
+            # Schedule clearing the speaking flag with small safety delay
+            self._schedule_clear_speaking(latency=0.2)
+
+    def _schedule_clear_speaking(self, latency=0.2):
+        # Cancel any existing timer
+        if self._clear_timer and self._clear_timer.is_alive():
+            self._clear_timer.cancel()
+        # Schedule flag clear after latency seconds
+        self._clear_timer = threading.Timer(latency, self._clear_speaking)
+        self._clear_timer.start()
+
+    def _clear_speaking(self):
+        """Clear speaking flag and reset current utterance ID."""
+        print(f"[Robot] Clearing is_speaking for utterance {self._current_utt}")
+        self._is_speaking = False
+        self._current_utt = None
 
     def move_arm(self,arm,position,velocity=75):
         assert position in range(-91,91), " moveArm: position needs to be -90 to 90"
@@ -479,6 +519,66 @@ class Socket:
                 "Message": ""}
         
         return unsubscribeMsg   
+
+class MistyTTSClient:
+    """
+    WebSocket listener for Misty's TextToSpeechComplete events.
+    Calls back into Robot._on_tts_complete when an utterance finishes.
+    """
+    def __init__(self, ip, on_tts_complete_callback, connect_timeout=5):
+        self.ip = ip
+        self.on_tts_complete = on_tts_complete_callback
+        self._ws_open_event = threading.Event()
+
+        # Setup WebSocketApp with handlers
+        self._ws = websocket.WebSocketApp(
+            f"ws://{self.ip}/pubsub",
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+        # Run in background thread
+        threading.Thread(target=self._ws.run_forever, daemon=True).start()
+
+        # Wait until subscription confirmed or timeout
+        if not self._ws_open_event.wait(timeout=connect_timeout):
+            raise RuntimeError("WebSocket connection to Misty failed to open within timeout")
+
+    def _on_open(self, ws):
+        # Subscribe to TTS completion events
+        subscribe_msg = {
+            "Operation": "subscribe",
+            "Type": "TextToSpeechComplete",
+            "EventName": "TTSComplete",
+            "Message": "",
+            "ReturnProperty": ""
+        }
+        ws.send(json.dumps(subscribe_msg))
+        self._ws_open_event.set()
+
+    def _on_message(self, ws, raw):
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        # Debug print
+        print("[TTSClient] Received WS message:", msg)
+        # Only handle structured TTSComplete events, skip registration or other string messages
+        if msg.get("eventName") == "TTSComplete":
+            message_payload = msg.get("message")
+            # Ensure payload is a dict with utteranceId
+            if isinstance(message_payload, dict):
+                utt = message_payload.get("utteranceId")
+                if utt:
+                    self.on_tts_complete(utt)
+        # else: ignore other event types
+
+    def _on_error(self, ws, error):
+        print("[TTSClient] WebSocket error:", error)
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        print("[TTSClient] WebSocket closed:", close_status_code, close_msg)
 
 # if __name__ == '__main__':
 #     robot = Robot('192.168.1.137')
